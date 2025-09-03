@@ -1,0 +1,24 @@
+[
+  {
+    "rule": {
+      "condition": {
+        "patient_type": "new"
+      },
+      "action": {
+        "assign_doctor": "Dr. Smith"
+      }
+    },
+    "raw": "New patients must be scheduled only with Dr. Smith in the morning.\n\n\n"
+  },
+  {
+    "rule": {
+      "condition": {
+        "patient_type": "returning"
+      },
+      "action": {
+        "assign_doctor": "Dr. Johnson"
+      }
+    },
+    "raw": "Returning patients should only be scheduled with Dr. Johnson in the afternoon.\n"
+  }
+]

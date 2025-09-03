@@ -3,12 +3,42 @@ from dotenv import load_dotenv
 import os
 import pandas as pd
 import uuid, random
+import re
 
+from datetime import datetime
 from agent.patient_db import PatientDB
 from agent.policy import duration_for_patient_type
 from agent.scheduler import Scheduler
 from agent.emailer import send_email
 from utils.calendar import create_ics_file
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+
+from agent.groq_client import parse_rule_to_json
+from agent.rules import load_rules, save_rule, delete_rule, apply_rules
+import json
+
+def validate_identity(first_name, last_name, dob):
+    errors = []
+    try:
+        dob_date = datetime.strptime(dob, "%Y-%m-%d").date()
+        if dob_date >= datetime.today().date():
+            errors.append("❌ DOB must be in the past.")
+    except ValueError:
+        errors.append("❌ DOB must be in YYYY-MM-DD format.")
+    return errors
+
+def validate_contact(email, phone, insurance):
+    errors = []
+    if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+        errors.append("❌ Invalid email address.")
+    if not re.match(r"^\+?\d{8,15}$", phone):
+        errors.append("❌ Phone must contain only digits (8–15 digits).")
+    if not insurance.strip():
+        errors.append("❌ Insurance company is required.")
+    return errors
+
+
 
 load_dotenv()
 
@@ -62,9 +92,7 @@ def require_nonempty(value, label):
 #  PATIENT PORTAL SECTION
 # ========================
 if mode == "Patient Portal":
-    with st.chat_message("assistant"):
-        st.write("👋 Hi! I’m your AI Scheduling Assistant. First, check if you’re an existing patient using your name and DOB.")
-
+    
     # ---------- Step 1: Identify patient ----------
     with st.form("identify_form", clear_on_submit=False):
         st.subheader("Step 1: Identify Patient")
@@ -74,10 +102,12 @@ if mode == "Patient Portal":
         submitted_identify = st.form_submit_button("Check")
 
     if submitted_identify:
-        if not (require_nonempty(first_name, "First Name") and
-                require_nonempty(last_name, "Last Name") and
-                require_nonempty(dob, "DOB (YYYY-MM-DD)")):
+        errors = validate_identity(first_name, last_name, dob)
+        if errors:
+            for e in errors:
+                st.error(e)
             st.stop()
+
 
         patient = db.find_patient(first_name, last_name, dob)
 
@@ -142,11 +172,14 @@ if mode == "Patient Portal":
             st.text_input("Group Number", value=details.get("group_number", ""), disabled=True, key="group_number_display")
 
         if st.button("Save Details & Load Available Slots"):
-            ok = True
-            ok &= require_nonempty(email_val, "Email")
-            ok &= require_nonempty(phone_val, "Phone")
-            ok &= require_nonempty(insurance_val, "Insurance Company")
-            if not ok:
+            errors = validate_contact(
+                email_val,
+                phone_val,
+                insurance_val
+            )
+            if errors:
+                for e in errors:
+                    st.error(e)
                 st.stop()
 
             st.session_state.patient_details.update({
@@ -158,17 +191,35 @@ if mode == "Patient Portal":
             minutes_needed = st.session_state.minutes or duration_for_patient_type(not st.session_state.patient_found)
             slots = scheduler.get_available_slots(minutes_required=minutes_needed) or []
 
-            # Remove already booked slots
             appt_file = os.path.join("app", "data", "appointments.xlsx")
-            if os.path.exists(appt_file) and not slots == []:
+            if os.path.exists(appt_file) and len(slots) > 0:
                 booked_df = pd.read_excel(appt_file)
-                booked_keys = set(zip(booked_df["date"], booked_df["time"], booked_df["doctor"]))
-                slots = [s for s in slots if (s["date"], s["time"], s["doctor"]) not in booked_keys]
 
-            st.session_state.available_slots = slots
+                if all(col in booked_df.columns for col in ["date", "time", "doctor"]):
+                    booked_keys = set(zip(booked_df["date"], booked_df["time"], booked_df["doctor"]))
+                    slots = [
+                        s for s in slots
+                        if (s["date"], s["time"], s["doctor"]) not in booked_keys
+                    ]
+
+            # Deduplicate slots
+            unique = {(s["date"], s["time"], s["doctor"]): s for s in slots}
+            slots = list(unique.values())
+
+            # 👉 Apply AI rules here
+            rules = load_rules()
+            patient_core = st.session_state.patient_core or {}
+            patient_details = st.session_state.patient_details or {}
+            patient_core["is_new"] = bool(st.session_state.is_new_patient)
+
+            slots, duration_override = apply_rules(patient_core, patient_details, slots, rules)
+            if duration_override:
+                st.session_state.minutes = duration_override
 
             st.session_state.available_slots = slots
             st.session_state.available_dates = sorted({s["date"] for s in slots})
+
+
             if not slots:
                 st.error("No available slots found.")
             else:
@@ -185,7 +236,7 @@ if mode == "Patient Portal":
         # Calendar date picker
         from datetime import date, timedelta
         today = date.today()
-        tomorrow = today + timedelta(days=1)
+        tomorrow = today + timedelta(days=6)
 
         selected_date = st.date_input(
             "Choose appointment date (only today/tomorrow allowed)",
@@ -290,8 +341,29 @@ if mode == "Patient Portal":
                     mime="text/calendar"
                 )
 
-                # Email confirmation
-                form_path = os.path.join("app", "assets", "intake_form.pdf")
+                # Email confirmatio
+
+                # Generate custom PDF for this patient
+                pdf_filename = f"intake_form_{core['last_name']}_{date}.pdf"
+                form_path = os.path.join("app", "data", pdf_filename)
+
+                c = canvas.Canvas(form_path, pagesize=letter)
+                c.setFont("Helvetica", 12)
+                c.drawString(50, 750, "Patient Intake Form")
+                c.drawString(50, 730, f"Name: {core['first_name']} {core['last_name']}")
+                c.drawString(50, 710, f"DOB: {core['dob']}")
+                c.drawString(50, 690, f"Email: {details['email']}")
+                c.drawString(50, 670, f"Phone: {details['phone']}")
+                c.drawString(50, 650, f"Insurance: {details['insurance_company']}")
+                c.drawString(50, 630, f"Member ID: {details['member_id']}")
+                c.drawString(50, 610, f"Group Number: {details['group_number']}")
+                c.drawString(50, 590, f"Appointment Date: {date}")
+                c.drawString(50, 570, f"Time: {time_str}")
+                c.drawString(50, 550, f"Doctor: Dr. {doctor}")
+                c.drawString(50, 530, f"Duration: {minutes_required} minutes")
+                c.save()
+
+                # Send personalized form in email
                 to_email = details["email"]
                 email_sent = False
                 if to_email:
@@ -299,10 +371,9 @@ if mode == "Patient Portal":
                     body = (
                         f"Hi {core['first_name']},\n\n"
                         f"Your appointment is confirmed on {date} at {time_str} with Dr. {doctor}.\n"
-                        f"Please find the intake form attached.\n\nThanks."
+                        f"Please find the personalized intake form attached.\n\nThanks."
                     )
-                    attachment_paths = [form_path] if os.path.exists(form_path) else None
-                    email_sent = send_email(to_email, subject, body, attachment_paths=attachment_paths)
+                    email_sent = send_email(to_email, subject, body, attachment_paths=[form_path])
 
                 if email_sent:
                     st.success("📧 Confirmation email sent to patient.")
@@ -330,6 +401,40 @@ if mode == "Admin Dashboard":
                 st.error("❌ Incorrect password.")
     else:
         st.subheader("📑 Admin Dashboard")
+        st.subheader("🧠 Scheduling Rules (AI)")
+
+        rule_text = st.text_area("Enter scheduling rule (natural language)", height=120, key="rule_text")
+
+        col1, col2 = st.columns([1,1])
+        with col1:
+            if st.button("Parse & Save Rule"):
+                if not rule_text.strip():
+                    st.error("Write a rule first.")
+                else:
+                    parsed, err = parse_rule_to_json(rule_text)
+                    if err or not parsed:
+                        st.error(f"AI parse error: {err}")
+                    else:
+                        save_rule(parsed, raw_text=rule_text)
+                        st.success("Rule parsed and saved.")
+                        st.rerun()
+
+        with col2:
+            if st.button("Reload Rules"):
+                st.rerun()
+
+        rules_list = load_rules()
+        for i, e in enumerate(rules_list):
+            rule = e.get("rule")
+            raw = e.get("raw", "")
+            st.markdown(f"**{i}.** `{json.dumps(rule)}`")
+            if raw:
+                st.caption(raw)
+            if st.button(f"Delete rule {i}", key=f"del_rule_{i}"):
+                delete_rule(i)
+                st.success("Deleted.")
+                st.rerun()
+            
         if st.button("Logout"):
             st.session_state.admin_logged_in = False
             st.info("🔒 Logged out successfully.")
