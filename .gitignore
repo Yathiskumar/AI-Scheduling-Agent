@@ -1,0 +1,57 @@
+# -------------------------
+# Python
+# -------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+*.log
+
+# Virtual environment
+.venv/
+env/
+venv/
+ENV/
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+
+# -------------------------
+# Streamlit / Cache
+# -------------------------
+.streamlit/
+.stcache/
+.stfolder/
+
+# -------------------------
+# Project Data
+# -------------------------
+app/data/*.xlsx
+app/data/*.csv
+
+# Don’t ignore templates or seeds:
+!app/data/patients.csv
+!app/data/doctor_schedule.xlsx
+
+# -------------------------
+# OS-specific
+# -------------------------
+.DS_Store
+Thumbs.db
+
+# -------------------------
+# Environment / Secrets
+# -------------------------
+.env
+*.key
+*.pem
+
+# -------------------------
+# IDE / Editor
+# -------------------------
+.vscode/
+.idea/
+*.iml
